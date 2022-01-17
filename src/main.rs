@@ -9,14 +9,14 @@ use std::sync::Arc;
 
 use clap::Parser;
 
-use hyper::body::HttpBody;
+use hyper::body::{HttpBody, Sender};
 use hyper::header::{AsHeaderName, HeaderMap, HeaderValue};
 use hyper::http::Method;
 use hyper::server::conn::AddrStream;
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Request, Response, Server, StatusCode};
 use thiserror::Error;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpSocket;
 use tokio::sync::{Mutex, MutexGuard};
@@ -42,7 +42,6 @@ struct Conn {
 struct ConnRx {
     buf: VecDeque<u8>,
     seq: usize,
-    stream: OwnedReadHalf,
 }
 
 struct ConnTx {
@@ -81,6 +80,45 @@ fn blank_status(s: StatusCode) -> Response<Body> {
     Response::builder().status(s).body(Body::empty()).unwrap()
 }
 
+async fn drainer(conn: ConnShared, mut sender: Sender, mut seq: usize) {
+    loop {
+        let buf: Vec<u8> = {
+            let conn_rx = conn.rx.lock().await;
+            if seq < conn_rx.seq - conn_rx.buf.len() {
+                break;
+            }
+            conn_rx
+                .buf
+                .range(conn_rx.buf.len() - (conn_rx.seq - seq)..)
+                .map(|b| *b)
+                .collect()
+        };
+        seq += buf.len();
+        if buf.is_empty() {
+            // TODO: wait
+            break;
+        }
+        if let Err(_) = sender.send_data(buf.into()).await {
+            break;
+        }
+    }
+}
+
+async fn filler(conn: ConnShared, mut stream: OwnedReadHalf) {
+    eprintln!("filler called");
+    let mut buf = [0u8; 65535];
+    while let Ok(bytes_read) = stream.read(&mut buf).await {
+        let valid_buf = &buf[..bytes_read];
+        if valid_buf.is_empty() {
+            break;
+        }
+        let mut conn_rx = conn.rx.lock().await;
+        conn_rx.buf.extend(valid_buf);
+        conn_rx.seq += valid_buf.len();
+    }
+    // TODO: notify end of stream
+}
+
 fn get_header_str<K: AsHeaderName>(hm: &HeaderMap<HeaderValue>, key: K) -> Option<&str> {
     hm.get(key)?.to_str().ok()
 }
@@ -104,7 +142,37 @@ async fn handle_get<'a>(
     addr: SocketAddr,
     mut req: Request<Body>,
 ) -> Result<Response<Body>, Infallible> {
-    Ok(blank_status(StatusCode::OK))
+    let id = match get_header_str(req.headers(), "i") {
+        Some(h) => h,
+        None => return Ok(blank_status(StatusCode::BAD_REQUEST)),
+    }
+    .to_owned();
+
+    let mut seq = match get_header_str(req.headers(), "s").map(|s| usize::from_str_radix(s, 10)) {
+        Some(Ok(s)) => s,
+        _ => return Ok(blank_status(StatusCode::BAD_REQUEST)),
+    };
+
+    let conn = match ctx.lock().await.conns.get_mut(&id).map(|c| c.clone()) {
+        Some(c) => c,
+        None => return Ok(blank_status(StatusCode::NOT_FOUND)),
+    };
+
+    {
+        let conn_rx = conn.rx.lock().await;
+        if seq < conn_rx.seq - conn_rx.buf.len() {
+            return Ok(blank_status(StatusCode::RANGE_NOT_SATISFIABLE));
+        }
+    }
+
+    let (sender, body) = Body::channel();
+
+    tokio::spawn(drainer(conn, sender, seq));
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .body(body)
+        .unwrap())
 }
 
 async fn handle_new_conn<'a>(
@@ -196,13 +264,14 @@ async fn handle_new_conn<'a>(
         rx: Mutex::new(ConnRx {
             buf: VecDeque::default(),
             seq: 0,
-            stream: stream_rx,
         }),
         tx: Mutex::new(ConnTx {
             seq: written,
             stream: stream_tx,
         }),
     });
+
+    let _ = tokio::spawn(filler(conn.clone(), stream_rx));
 
     {
         let mut ctx_locked = ctx.lock().await;
