@@ -1,8 +1,10 @@
 #![feature(async_closure)]
 
+use std::cmp::min;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::convert::Infallible;
 use std::net::{AddrParseError, SocketAddr};
+use std::str::FromStr;
 use std::sync::Arc;
 
 use clap::Parser;
@@ -15,7 +17,8 @@ use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Request, Response, Server, StatusCode};
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
-use tokio::net::{TcpSocket, TcpStream};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::net::TcpSocket;
 use tokio::sync::{Mutex, MutexGuard};
 
 #[derive(Parser, Debug)]
@@ -32,13 +35,20 @@ struct Cfg {
 }
 
 struct Conn {
-    stream: TcpStream,
-    tx_seq: usize,
+    rx: Mutex<ConnRx>,
+    tx: Mutex<ConnTx>,
 }
 
-type ConnLcoked<'a> = MutexGuard<'a, Conn>;
+struct ConnRx {
+    stream: OwnedReadHalf,
+}
 
-type ConnShared = Arc<Mutex<Conn>>;
+struct ConnTx {
+    stream: OwnedWriteHalf,
+    seq: usize,
+}
+
+type ConnShared = Arc<Conn>;
 
 struct Ctx {
     conns: HashMap<String, ConnShared>,
@@ -91,13 +101,8 @@ async fn handle_new_conn<'a>(
     addr: SocketAddr,
     mut req: Request<Body>,
 ) -> Result<Response<Body>, Infallible> {
-    let d = match get_header_str(req.headers(), "d") {
-        Some(h) => h,
-        _ => return Ok(blank_status(StatusCode::BAD_REQUEST)),
-    };
-
-    let dst: SocketAddr = match d.parse() {
-        Ok(a) => a,
+    let dst = match get_header_str(req.headers(), "d").map(SocketAddr::from_str) {
+        Some(Ok(d)) => d,
         _ => return Ok(blank_status(StatusCode::BAD_REQUEST)),
     };
 
@@ -139,13 +144,17 @@ async fn handle_new_conn<'a>(
         }
     }
 
-    let mut stream = match sock.connect(dst).await {
+    let stream = match sock.connect(dst).await {
         Ok(s) => s,
         _ => {
             revert(id).await;
             return Ok(blank_status(StatusCode::BAD_GATEWAY));
         }
     };
+
+    let _ = stream.set_nodelay(true);
+
+    let (stream_rx, mut stream_tx) = stream.into_split();
 
     let mut written = 0usize;
 
@@ -154,7 +163,7 @@ async fn handle_new_conn<'a>(
             Ok(chunk) => {
                 let mut i = 0usize;
                 while i < chunk.len() {
-                    match stream.write(&chunk[i..]).await {
+                    match stream_tx.write(&chunk[i..]).await {
                         Ok(this_written) => {
                             i += this_written;
                             written += this_written;
@@ -171,10 +180,13 @@ async fn handle_new_conn<'a>(
         }
     }
 
-    let conn = Arc::new(Mutex::new(Conn {
-        stream,
-        tx_seq: written,
-    }));
+    let conn = Arc::new(Conn {
+        rx: Mutex::new(ConnRx { stream: stream_rx }),
+        tx: Mutex::new(ConnTx {
+            seq: written,
+            stream: stream_tx,
+        }),
+    });
 
     {
         let mut ctx_locked = ctx.lock().await;
@@ -203,22 +215,36 @@ async fn handle_post(
         None => return Ok(blank_status(StatusCode::BAD_REQUEST)),
     };
 
+    let mut seq = match get_header_str(req.headers(), "s").map(|s| usize::from_str_radix(s, 10)) {
+        Some(Ok(s)) => s,
+        _ => return Ok(blank_status(StatusCode::BAD_REQUEST)),
+    };
+
     let conn = match ctx.lock().await.conns.get_mut(id).map(|c| c.clone()) {
         Some(c) => c,
         None => return Ok(blank_status(StatusCode::NOT_FOUND)),
     };
 
-    let mut written = 0usize;
+    let mut conn_tx = conn.tx.lock().await;
+
+    if seq > conn_tx.seq {
+        return Ok(blank_status(StatusCode::RANGE_NOT_SATISFIABLE));
+    }
+
+    let mut consumed = 0usize; // either skipped as duplicate, or actually written
 
     'outer: while let Some(chunk_result) = req.body_mut().data().await {
         match chunk_result {
             Ok(chunk) => {
-                let mut i = 0usize;
+                let mut i = conn_tx.seq - seq;
+                let skipped = min(i, chunk.len());
+                consumed += skipped;
                 while i < chunk.len() {
-                    match conn.lock().await.stream.write(&chunk[i..]).await {
+                    match conn_tx.stream.write(&chunk[i..]).await {
                         Ok(this_written) => {
                             i += this_written;
-                            written += this_written;
+                            conn_tx.seq += this_written;
+                            seq += this_written;
                         }
                         Err(_) => {
                             break 'outer;
@@ -232,11 +258,9 @@ async fn handle_post(
         }
     }
 
-    conn.lock().await.tx_seq += written;
-
     Ok(Response::builder()
         .status(StatusCode::NO_CONTENT)
-        .header("w", written.to_string())
+        .header("w", consumed.to_string())
         .body(Body::empty())
         .unwrap())
 }
