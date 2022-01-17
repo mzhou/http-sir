@@ -40,12 +40,14 @@ struct Conn {
 }
 
 struct ConnRx {
+    buf: VecDeque<u8>,
+    seq: usize,
     stream: OwnedReadHalf,
 }
 
 struct ConnTx {
-    stream: OwnedWriteHalf,
     seq: usize,
+    stream: OwnedWriteHalf,
 }
 
 type ConnShared = Arc<Conn>;
@@ -90,9 +92,19 @@ async fn handle(
     req: Request<Body>,
 ) -> Result<Response<Body>, Infallible> {
     match req.method() {
+        &Method::GET => handle_get(cfg, ctx, addr, req).await,
         &Method::POST => handle_post(cfg, ctx, addr, req).await,
         _ => Ok(blank_status(StatusCode::METHOD_NOT_ALLOWED)),
     }
+}
+
+async fn handle_get<'a>(
+    cfg: Arc<Cfg>,
+    ctx: CtxShared,
+    addr: SocketAddr,
+    mut req: Request<Body>,
+) -> Result<Response<Body>, Infallible> {
+    Ok(blank_status(StatusCode::OK))
 }
 
 async fn handle_new_conn<'a>(
@@ -181,7 +193,11 @@ async fn handle_new_conn<'a>(
     }
 
     let conn = Arc::new(Conn {
-        rx: Mutex::new(ConnRx { stream: stream_rx }),
+        rx: Mutex::new(ConnRx {
+            buf: VecDeque::default(),
+            seq: 0,
+            stream: stream_rx,
+        }),
         tx: Mutex::new(ConnTx {
             seq: written,
             stream: stream_tx,
@@ -190,6 +206,7 @@ async fn handle_new_conn<'a>(
 
     {
         let mut ctx_locked = ctx.lock().await;
+        ctx_locked.reserved_ids.remove(&id);
         ctx_locked.conns.insert(id, conn);
     }
 
