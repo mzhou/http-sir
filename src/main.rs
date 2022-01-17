@@ -1,4 +1,6 @@
-use std::collections::HashMap;
+#![feature(async_closure)]
+
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::convert::Infallible;
 use std::net::{AddrParseError, SocketAddr};
 use std::sync::Arc;
@@ -30,14 +32,17 @@ struct Cfg {
 }
 
 struct Conn {
-    sock: TcpStream,
+    stream: TcpStream,
+    tx_seq: usize,
 }
 
 type ConnLcoked<'a> = MutexGuard<'a, Conn>;
+
 type ConnShared = Arc<Mutex<Conn>>;
 
 struct Ctx {
     conns: HashMap<String, ConnShared>,
+    reserved_ids: HashSet<String>,
 }
 
 type CtxLcoked<'a> = MutexGuard<'a, Ctx>;
@@ -51,20 +56,11 @@ enum MainError {
     Hyper(#[from] hyper::Error),
 }
 
-impl Conn {
-    fn new(sock: TcpStream) -> Self {
-        Self { sock }
-    }
-
-    fn new_shared(sock: TcpStream) -> ConnShared {
-        Arc::new(Mutex::new(Self::new(sock)))
-    }
-}
-
 impl Ctx {
     fn new() -> Self {
         Self {
             conns: HashMap::default(),
+            reserved_ids: HashSet::default(),
         }
     }
 }
@@ -111,21 +107,45 @@ async fn handle_new_conn<'a>(
     }
     .to_owned();
 
+    {
+        let mut ctx_locked = ctx.lock().await;
+        if ctx_locked.conns.contains_key(&id) {
+            return Ok(blank_status(StatusCode::CONFLICT));
+        }
+        if !ctx_locked.reserved_ids.insert(id.clone()) {
+            return Ok(blank_status(StatusCode::CONFLICT));
+        }
+    }
+
+    let revert = {
+        let ctx = ctx.clone();
+        async move |id: String| {
+            ctx.lock().await.conns.remove(&id);
+        }
+    };
+
     let sock = match TcpSocket::new_v4() {
         Ok(s) => s,
-        _ => return Ok(blank_status(StatusCode::INTERNAL_SERVER_ERROR)),
+        _ => {
+            revert(id).await;
+            return Ok(blank_status(StatusCode::INTERNAL_SERVER_ERROR));
+        }
     };
     match sock.bind(cfg.stream_bind) {
         Ok(s) => s,
-        _ => return Ok(blank_status(StatusCode::INTERNAL_SERVER_ERROR)),
+        _ => {
+            revert(id).await;
+            return Ok(blank_status(StatusCode::INTERNAL_SERVER_ERROR));
+        }
     }
 
-    let stream = match sock.connect(dst).await {
+    let mut stream = match sock.connect(dst).await {
         Ok(s) => s,
-        _ => return Ok(blank_status(StatusCode::BAD_GATEWAY)),
+        _ => {
+            revert(id).await;
+            return Ok(blank_status(StatusCode::BAD_GATEWAY));
+        }
     };
-
-    let conn = Conn::new_shared(stream);
 
     let mut written = 0usize;
 
@@ -134,7 +154,7 @@ async fn handle_new_conn<'a>(
             Ok(chunk) => {
                 let mut i = 0usize;
                 while i < chunk.len() {
-                    match conn.lock().await.sock.write(&chunk[i..]).await {
+                    match stream.write(&chunk[i..]).await {
                         Ok(this_written) => {
                             i += this_written;
                             written += this_written;
@@ -151,7 +171,15 @@ async fn handle_new_conn<'a>(
         }
     }
 
-    ctx.lock().await.conns.insert(id, conn);
+    let conn = Arc::new(Mutex::new(Conn {
+        stream,
+        tx_seq: written,
+    }));
+
+    {
+        let mut ctx_locked = ctx.lock().await;
+        ctx_locked.conns.insert(id, conn);
+    }
 
     Ok(Response::builder()
         .status(StatusCode::NO_CONTENT)
@@ -164,7 +192,7 @@ async fn handle_post(
     cfg: Arc<Cfg>,
     ctx: CtxShared,
     addr: SocketAddr,
-    req: Request<Body>,
+    mut req: Request<Body>,
 ) -> Result<Response<Body>, Infallible> {
     if req.headers().contains_key("d") {
         return handle_new_conn(cfg, ctx, addr, req).await;
@@ -180,7 +208,37 @@ async fn handle_post(
         None => return Ok(blank_status(StatusCode::NOT_FOUND)),
     };
 
-    Ok(blank_status(StatusCode::NO_CONTENT))
+    let mut written = 0usize;
+
+    'outer: while let Some(chunk_result) = req.body_mut().data().await {
+        match chunk_result {
+            Ok(chunk) => {
+                let mut i = 0usize;
+                while i < chunk.len() {
+                    match conn.lock().await.stream.write(&chunk[i..]).await {
+                        Ok(this_written) => {
+                            i += this_written;
+                            written += this_written;
+                        }
+                        Err(_) => {
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+            Err(_) => {
+                break 'outer;
+            }
+        }
+    }
+
+    conn.lock().await.tx_seq += written;
+
+    Ok(Response::builder()
+        .status(StatusCode::NO_CONTENT)
+        .header("w", written.to_string())
+        .body(Body::empty())
+        .unwrap())
 }
 
 #[tokio::main]
