@@ -8,7 +8,6 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use clap::Parser;
-
 use hyper::body::{HttpBody, Sender};
 use hyper::header::{AsHeaderName, HeaderMap, HeaderValue};
 use hyper::http::Method;
@@ -17,9 +16,9 @@ use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Request, Response, Server, StatusCode};
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpSocket;
-use tokio::sync::{Mutex, MutexGuard};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::sync::Mutex;
 
 #[derive(Parser, Debug)]
 #[clap()]
@@ -56,7 +55,6 @@ struct Ctx {
     reserved_ids: HashSet<String>,
 }
 
-type CtxLcoked<'a> = MutexGuard<'a, Ctx>;
 type CtxShared = Arc<Mutex<Ctx>>;
 
 #[derive(Debug, Error)]
