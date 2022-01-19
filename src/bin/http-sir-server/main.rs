@@ -16,8 +16,8 @@ use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Request, Response, Server, StatusCode};
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpSocket;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::net::TcpSocket;
 use tokio::sync::Mutex;
 
 #[derive(Parser, Debug)]
@@ -103,7 +103,7 @@ async fn drainer(conn: ConnShared, mut sender: Sender, mut seq: usize) {
 }
 
 async fn filler(conn: ConnShared, mut stream: OwnedReadHalf) {
-    eprintln!("filler called");
+    //eprintln!("filler called");
     let mut buf = [0u8; 65535];
     while let Ok(bytes_read) = stream.read(&mut buf).await {
         let valid_buf = &buf[..bytes_read];
@@ -278,7 +278,7 @@ async fn handle_new_conn<'a>(
     }
 
     Ok(Response::builder()
-        .status(StatusCode::NO_CONTENT)
+        .status(StatusCode::CREATED)
         .header("w", written.to_string())
         .body(Body::empty())
         .unwrap())
@@ -311,6 +311,8 @@ async fn handle_post(
 
     let mut conn_tx = conn.tx.lock().await;
 
+    //eprintln!("handle_post seq {} expected {}", seq, conn_tx.seq);
+
     if seq > conn_tx.seq {
         return Ok(blank_status(StatusCode::RANGE_NOT_SATISFIABLE));
     }
@@ -323,9 +325,11 @@ async fn handle_post(
                 let mut i = conn_tx.seq - seq;
                 let skipped = min(i, chunk.len());
                 consumed += skipped;
+                //eprintln!("i {} chunk.len {}", i, chunk.len());
                 while i < chunk.len() {
                     match conn_tx.stream.write(&chunk[i..]).await {
                         Ok(this_written) => {
+                            //eprintln!("this_written {}", this_written);
                             i += this_written;
                             conn_tx.seq += this_written;
                             seq += this_written;
@@ -343,7 +347,7 @@ async fn handle_post(
     }
 
     Ok(Response::builder()
-        .status(StatusCode::NO_CONTENT)
+        .status(StatusCode::OK)
         .header("w", consumed.to_string())
         .body(Body::empty())
         .unwrap())
