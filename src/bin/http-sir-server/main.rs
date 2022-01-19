@@ -18,6 +18,7 @@ use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpSocket;
+use tokio::sync::watch;
 use tokio::sync::Mutex;
 
 #[derive(Parser, Debug)]
@@ -35,6 +36,8 @@ struct Cfg {
 
 struct Conn {
     rx: Mutex<ConnRx>,
+    rx_pub: watch::Sender<usize>,
+    rx_sub: watch::Receiver<usize>,
     tx: Mutex<ConnTx>,
 }
 
@@ -79,6 +82,7 @@ fn blank_status(s: StatusCode) -> Response<Body> {
 }
 
 async fn drainer(conn: ConnShared, mut sender: Sender, mut seq: usize) {
+    let mut rx_sub = conn.rx_sub.clone();
     loop {
         let buf: Vec<u8> = {
             let conn_rx = conn.rx.lock().await;
@@ -93,8 +97,11 @@ async fn drainer(conn: ConnShared, mut sender: Sender, mut seq: usize) {
         };
         seq += buf.len();
         if buf.is_empty() {
-            // TODO: wait
-            break;
+            if let Err(_) = rx_sub.changed().await {
+                break;
+            }
+            rx_sub.borrow_and_update();
+            continue;
         }
         if let Err(_) = sender.send_data(buf.into()).await {
             break;
@@ -113,6 +120,11 @@ async fn filler(conn: ConnShared, mut stream: OwnedReadHalf) {
         let mut conn_rx = conn.rx.lock().await;
         conn_rx.buf.extend(valid_buf);
         conn_rx.seq += valid_buf.len();
+        let seq = conn_rx.seq;
+        drop(conn_rx);
+        if let Err(_) = conn.rx_pub.send(seq) {
+            break;
+        }
     }
     // TODO: notify end of stream
 }
@@ -258,11 +270,15 @@ async fn handle_new_conn<'a>(
         }
     }
 
+    let (rx_pub, rx_sub) = watch::channel::<usize>(0);
+
     let conn = Arc::new(Conn {
         rx: Mutex::new(ConnRx {
             buf: VecDeque::default(),
             seq: 0,
         }),
+        rx_pub,
+        rx_sub,
         tx: Mutex::new(ConnTx {
             seq: written,
             stream: stream_tx,
@@ -330,6 +346,7 @@ async fn handle_post(
                     match conn_tx.stream.write(&chunk[i..]).await {
                         Ok(this_written) => {
                             //eprintln!("this_written {}", this_written);
+                            consumed += this_written;
                             i += this_written;
                             conn_tx.seq += this_written;
                             seq += this_written;
