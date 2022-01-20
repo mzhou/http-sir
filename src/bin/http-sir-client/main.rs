@@ -16,7 +16,7 @@ use hyper::header::{AsHeaderName, HeaderMap, HeaderValue};
 use hyper::http::Method;
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Request, Response, Server, StatusCode};
-use hyper_tls::HttpsConnector;
+use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
@@ -81,7 +81,14 @@ enum ServiceError {
 impl Ctx {
     fn new() -> Self {
         Self {
-            client: Client::builder().build(HttpsConnector::new()),
+            client: Client::builder().build(
+                HttpsConnectorBuilder::new()
+                    .with_native_roots()
+                    .https_or_http()
+                    .enable_http1()
+                    .enable_http2()
+                    .build(),
+            ),
         }
     }
 }
