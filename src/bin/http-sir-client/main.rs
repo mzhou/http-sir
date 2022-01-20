@@ -96,6 +96,8 @@ impl Ctx {
 }
 
 async fn handle(cfg: CfgShared, ctx: CtxShared, mut stream: TcpStream, addr: SocketAddr) -> () {
+    let _ = stream.set_nodelay(true);
+
     let target = if cfg.target == "socks5" {
         let mut buf = [0u8; 255];
         if stream.read_exact(&mut buf[..1]).await.unwrap_or(0) != 1 {
