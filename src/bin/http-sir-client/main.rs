@@ -3,10 +3,11 @@
 use std::cmp::min;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::convert::Infallible;
-use std::net::{AddrParseError, SocketAddr};
+use std::net::{AddrParseError, Ipv4Addr, SocketAddr};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::Parser;
 use hyper::body::HttpBody;
@@ -21,23 +22,24 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, MutexGuard};
+use tokio::time::sleep;
 use uuid::Uuid;
 
 #[derive(Parser, Debug)]
 #[clap()]
 struct Args {
     #[clap(long)]
-    connect: String,
-    #[clap(long)]
     listen: String,
     #[clap(default_value = "[::]:0", long)]
     http_bind: String,
     #[clap(long)]
     url: String,
+    #[clap(long)]
+    target: String,
 }
 
 struct Cfg {
-    connect: String,
+    target: String,
     listen: SocketAddr,
     url: String,
 }
@@ -84,12 +86,80 @@ impl Ctx {
     }
 }
 
-async fn handle(cfg: CfgShared, ctx: CtxShared, stream: TcpStream, addr: SocketAddr) -> () {
+async fn handle(cfg: CfgShared, ctx: CtxShared, mut stream: TcpStream, addr: SocketAddr) -> () {
+    let target = if cfg.target == "socks5" {
+        let mut buf = [0u8; 255];
+        if stream.read_exact(&mut buf[..1]).await.unwrap_or(0) != 1 {
+            eprintln!("socks5 couldn't read ver");
+            return;
+        }
+        if buf[0] != 5 {
+            eprintln!("socks5 invalid ver");
+            return;
+        }
+        if stream.read_exact(&mut buf[..1]).await.unwrap_or(0) != 1 {
+            eprintln!("socks5 couldn't read nmethods");
+            return;
+        }
+        let nmethods = buf[0] as usize;
+        if stream.read_exact(&mut buf[..nmethods]).await.unwrap_or(0) != nmethods {
+            eprintln!("socks5 couldn't read methods");
+            return;
+        }
+        if buf[..nmethods].iter().find(|m| **m == 0u8) == None {
+            eprintln!("socks5 method 0 wasn't offered");
+            return;
+        }
+        if !stream.write_all(&[5u8, 0]).await.is_ok() {
+            eprintln!("socks5 couldn't send method");
+            return;
+        }
+        if stream.read_exact(&mut buf[..10]).await.unwrap_or(0) != 10 {
+            eprintln!("socks5 couldn't read request");
+            return;
+        }
+        if buf[0] != 5 {
+            eprintln!("socks5 incorrect version");
+            return;
+        }
+        if buf[1] != 1 {
+            eprintln!("socks5 incorrect cmd");
+            return;
+        }
+        if buf[2] != 0 {
+            eprintln!("socks5 incorrect rsv");
+            return;
+        }
+        // TODO: ipv6 support
+        if buf[3] != 1 {
+            eprintln!("socks5 incorrect atyp expected 1 got {}", buf[3]);
+            return;
+        }
+        if !stream
+            .write_all(&[5u8, 0, 0, 1, 0, 0, 0, 0, 0, 0])
+            .await
+            .is_ok()
+        {
+            eprintln!("socks5 couldn't send reply");
+            return;
+        }
+        eprintln!("socks5 proceeding");
+        SocketAddr::new(
+            Ipv4Addr::new(buf[4], buf[5], buf[6], buf[7]).into(),
+            (buf[8] as u16) << 8 | (buf[9] as u16),
+        )
+        .to_string()
+    } else {
+        cfg.target.clone()
+    };
+
     let id = format!("{}", Uuid::new_v4().to_hyphenated_ref());
     let client = ctx.client.clone();
 
+    eprintln!("{} connecting to {}", id, target);
+
     let connect_req = Request::builder()
-        .header("d", &cfg.connect)
+        .header("d", &target)
         .header("i", &id)
         .method(Method::POST)
         .uri(&cfg.url)
@@ -98,17 +168,18 @@ async fn handle(cfg: CfgShared, ctx: CtxShared, stream: TcpStream, addr: SocketA
     let connect_res = match client.request(connect_req).await {
         Ok(r) => r,
         Err(e) => {
-            //eprintln!("connect_req {:?}", e);
+            eprintln!("{} connect_req {:?}", id, e);
             return;
         }
     };
-    if connect_res.status() != StatusCode::OK {
-        //eprintln!("connect_req {}", connect_res.status());
+    if connect_res.status() != StatusCode::CREATED {
+        eprintln!("{} connect_res status {}", id, connect_res.status());
+        return;
     }
 
     let conn = ConnShared::new(Conn {
         active_tx: AtomicUsize::default(),
-        id,
+        id: id.clone(),
         seq_rx: AtomicUsize::default(),
     });
 
@@ -124,7 +195,14 @@ async fn handle(cfg: CfgShared, ctx: CtxShared, stream: TcpStream, addr: SocketA
     let mut seq = 0usize;
     let mut buf = [0u8; 65535];
     while let Ok(bytes_received) = stream_rx.read(&mut buf).await {
+        if bytes_received == 0 {
+            break;
+        }
         let buf_valid = &buf[..bytes_received];
+        while conn.active_tx.load(Ordering::Relaxed) >= 4 {
+            sleep(Duration::from_millis(5)).await;
+        }
+        //eprintln!("{} spawn transmit seq {} len {}", &id, seq, buf_valid.len());
         tokio::spawn(transmit(
             cfg.clone(),
             ctx.clone(),
@@ -132,8 +210,11 @@ async fn handle(cfg: CfgShared, ctx: CtxShared, stream: TcpStream, addr: SocketA
             seq,
             Vec::from(buf_valid),
         ));
+        conn.active_tx.fetch_add(1, Ordering::Relaxed);
         seq += buf_valid.len();
     }
+
+    eprintln!("{} left read loop", id);
 }
 
 #[tokio::main]
@@ -143,7 +224,7 @@ async fn main() -> Result<(), MainError> {
     let listen: SocketAddr = args.listen.parse()?;
 
     let cfg = Arc::new(Cfg {
-        connect: args.connect,
+        target: args.target,
         listen,
         url: args.url,
     });
@@ -230,19 +311,22 @@ async fn transmit(
         let res = match ctx.client.request(req).await {
             Ok(r) => r,
             Err(e) => {
-                //eprintln!("transmit {:?}", e);
+                eprintln!("{} transmit {} {:?}", conn.id, seq, e);
+                sleep(Duration::from_millis(5)).await;
                 continue;
             }
         };
         if res.status() != StatusCode::OK {
-            //eprintln!("transmit {}", res.status());
+            eprintln!("{} transmit {} status {}", conn.id, seq, res.status());
             if res.status() == StatusCode::RANGE_NOT_SATISFIABLE {
+                sleep(Duration::from_millis(5)).await;
                 continue;
             } else {
                 break;
             }
         }
-        //eprintln!("transmit ok");
         break;
     }
+
+    conn.active_tx.fetch_sub(1, Ordering::Relaxed);
 }
