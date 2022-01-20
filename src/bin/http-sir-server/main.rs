@@ -415,7 +415,9 @@ async fn main() -> Result<(), MainError> {
         async move { Ok::<_, Infallible>(service) }
     });
 
-    let server = Server::bind(&http_bind).serve(make_service);
+    let server = Server::bind(&http_bind)
+        .tcp_nodelay(true)
+        .serve(make_service);
 
     server.await?;
 
