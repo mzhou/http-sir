@@ -325,6 +325,20 @@ async fn handle_post(
         None => return Ok(blank_status(StatusCode::NOT_FOUND)),
     };
 
+    let ack: usize = get_header_str(req.headers(), "ack")
+        .map(|a| usize::from_str_radix(a, 10).unwrap_or(0))
+        .unwrap_or(0);
+
+    // trim rx buffer from ack
+    {
+        let mut conn_rx = conn.rx.lock().await;
+        if ack <= conn_rx.seq {
+            let bytes_to_keep = conn_rx.seq - ack;
+            let old_len = conn_rx.buf.len();
+            conn_rx.buf.drain(..old_len - bytes_to_keep);
+        }
+    }
+
     let mut conn_tx = conn.tx.lock().await;
 
     //eprintln!("handle_post seq {} expected {}", seq, conn_tx.seq);
