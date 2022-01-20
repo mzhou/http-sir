@@ -125,6 +125,7 @@ async fn filler(conn: ConnShared, mut stream: OwnedReadHalf) {
         if let Err(_) = conn.rx_pub.send(seq) {
             break;
         }
+        // TODO: wait for buffer space before letting next iteration run
     }
     // TODO: notify end of stream
 }
@@ -158,7 +159,7 @@ async fn handle_get<'a>(
     }
     .to_owned();
 
-    let mut seq = match get_header_str(req.headers(), "s").map(|s| usize::from_str_radix(s, 10)) {
+    let seq = match get_header_str(req.headers(), "s").map(|s| usize::from_str_radix(s, 10)) {
         Some(Ok(s)) => s,
         _ => return Ok(blank_status(StatusCode::BAD_REQUEST)),
     };
@@ -325,9 +326,13 @@ async fn handle_post(
         None => return Ok(blank_status(StatusCode::NOT_FOUND)),
     };
 
-    let ack: usize = get_header_str(req.headers(), "ack")
+    let ack: usize = get_header_str(req.headers(), "a")
         .map(|a| usize::from_str_radix(a, 10).unwrap_or(0))
         .unwrap_or(0);
+
+    let fin: bool = get_header_str(req.headers(), "f")
+        .map(|f| f == "1")
+        .unwrap_or(false);
 
     // trim rx buffer from ack
     {
@@ -375,6 +380,13 @@ async fn handle_post(
                 break 'outer;
             }
         }
+    }
+
+    // if we got fin, and we managed to catch up, shutdown the writer
+    if fin && seq == conn_tx.seq {
+        conn_tx.stream.shutdown().await;
+        seq += 1;
+        conn_tx.seq += 1;
     }
 
     Ok(Response::builder()

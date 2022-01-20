@@ -216,12 +216,17 @@ async fn handle(cfg: CfgShared, ctx: CtxShared, mut stream: TcpStream, addr: Soc
             conn.clone(),
             seq,
             Vec::from(buf_valid),
+            false,
         ));
         conn.active_tx.fetch_add(1, Ordering::Relaxed);
         seq += buf_valid.len();
     }
 
     eprintln!("{} left read loop", id);
+
+    tokio::spawn(transmit(cfg, ctx, conn, seq, Vec::new(), true));
+
+    eprintln!("{} sent fin", id);
 }
 
 #[tokio::main]
@@ -304,10 +309,11 @@ async fn transmit(
     conn: ConnShared,
     seq: usize,
     data: Vec<u8>,
+    fin: bool,
 ) -> () {
     //eprintln!("transmit seq {} len {}", seq, data.len());
     loop {
-        let req = Request::builder()
+        let mut req = Request::builder()
             .header("a", conn.seq_rx.load(Ordering::Relaxed))
             .header("i", &conn.id)
             .header("s", seq.to_string())
@@ -315,6 +321,10 @@ async fn transmit(
             .uri(&cfg.url)
             .body(Body::from(data.clone()))
             .unwrap();
+        if fin {
+            req.headers_mut()
+                .insert("f", HeaderValue::from_str("1").unwrap());
+        }
         let res = match ctx.client.request(req).await {
             Ok(r) => r,
             Err(e) => {
