@@ -339,7 +339,9 @@ async fn transmit(
         };
         if res.status() != StatusCode::OK {
             eprintln!("{} transmit {} status {}", conn.id, seq, res.status());
-            if res.status() == StatusCode::RANGE_NOT_SATISFIABLE {
+            if res.status() == StatusCode::RANGE_NOT_SATISFIABLE
+                || res.status() == StatusCode::SERVICE_UNAVAILABLE
+            {
                 sleep(Duration::from_millis(5)).await;
                 continue;
             } else {

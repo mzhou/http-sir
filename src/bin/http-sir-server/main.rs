@@ -43,6 +43,7 @@ struct Conn {
 
 struct ConnRx {
     buf: VecDeque<u8>,
+    fin: bool,
     seq: usize,
 }
 
@@ -84,19 +85,28 @@ fn blank_status(s: StatusCode) -> Response<Body> {
 async fn drainer(conn: ConnShared, mut sender: Sender, mut seq: usize) {
     let mut rx_sub = conn.rx_sub.clone();
     loop {
+        let mut fin = false;
         let buf: Vec<u8> = {
             let conn_rx = conn.rx.lock().await;
             if seq < conn_rx.seq - conn_rx.buf.len() {
                 break;
             }
-            conn_rx
-                .buf
-                .range(conn_rx.buf.len() - (conn_rx.seq - seq)..)
-                .map(|b| *b)
-                .collect()
+            fin = conn_rx.fin;
+            if seq <= conn_rx.seq {
+                conn_rx
+                    .buf
+                    .range(conn_rx.buf.len() - (conn_rx.seq - seq)..)
+                    .map(|b| *b)
+                    .collect()
+            } else {
+                Vec::new()
+            }
         };
         seq += buf.len();
         if buf.is_empty() {
+            if fin {
+                break;
+            }
             if let Err(_) = rx_sub.changed().await {
                 break;
             }
@@ -169,21 +179,25 @@ async fn handle_get<'a>(
         None => return Ok(blank_status(StatusCode::NOT_FOUND)),
     };
 
+    let mut fin = false;
+
     {
         let conn_rx = conn.rx.lock().await;
         if seq < conn_rx.seq - conn_rx.buf.len() {
             return Ok(blank_status(StatusCode::RANGE_NOT_SATISFIABLE));
         }
+        fin = conn_rx.fin;
     }
 
     let (sender, body) = Body::channel();
 
     tokio::spawn(drainer(conn, sender, seq));
 
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .body(body)
-        .unwrap())
+    let res = Response::builder().status(StatusCode::OK);
+
+    if fin {}
+
+    Ok(res.body(body).unwrap())
 }
 
 async fn handle_new_conn<'a>(
@@ -276,6 +290,7 @@ async fn handle_new_conn<'a>(
     let conn = Arc::new(Conn {
         rx: Mutex::new(ConnRx {
             buf: VecDeque::default(),
+            fin: false,
             seq: 0,
         }),
         rx_pub,
@@ -340,7 +355,9 @@ async fn handle_post(
         if ack <= conn_rx.seq {
             let bytes_to_keep = conn_rx.seq - ack;
             let old_len = conn_rx.buf.len();
-            conn_rx.buf.drain(..old_len - bytes_to_keep);
+            if bytes_to_keep <= old_len {
+                conn_rx.buf.drain(..old_len - bytes_to_keep);
+            }
         }
     }
 
