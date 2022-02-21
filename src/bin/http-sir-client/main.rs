@@ -81,6 +81,7 @@ enum ServiceError {
 impl Ctx {
     fn new() -> Self {
         let mut http_connector = HttpConnector::new();
+        http_connector.enforce_http(false);
         http_connector.set_nodelay(true);
         Self {
             client: Client::builder().build(
