@@ -119,6 +119,7 @@ async fn drainer(conn: ConnShared, mut sender: Sender, mut seq: usize) {
     }
 }
 
+// loop that reads from remote and fills buffer
 async fn filler(conn: ConnShared, mut stream: OwnedReadHalf) {
     //eprintln!("filler called");
     let mut buf = [0u8; 65535];
@@ -137,7 +138,6 @@ async fn filler(conn: ConnShared, mut stream: OwnedReadHalf) {
         }
         // TODO: wait for buffer space before letting next iteration run
     }
-    // TODO: notify end of stream
 }
 
 fn get_header_str<K: AsHeaderName>(hm: &HeaderMap<HeaderValue>, key: K) -> Option<&str> {
@@ -161,7 +161,7 @@ async fn handle_get<'a>(
     cfg: Arc<Cfg>,
     ctx: CtxShared,
     addr: SocketAddr,
-    mut req: Request<Body>,
+    req: Request<Body>,
 ) -> Result<Response<Body>, Infallible> {
     let id = match get_header_str(req.headers(), "i") {
         Some(h) => h,
@@ -301,7 +301,16 @@ async fn handle_new_conn<'a>(
         }),
     });
 
-    let _ = tokio::spawn(filler(conn.clone(), stream_rx));
+    let _ = tokio::spawn({
+        let conn = conn.clone();
+        let ctx = ctx.clone();
+        let id = id.clone();
+        async move {
+            filler(conn.clone(), stream_rx).await;
+            let mut ctx_locked = ctx.lock().await;
+            ctx_locked.conns.remove(&id);
+        }
+    });
 
     {
         let mut ctx_locked = ctx.lock().await;
