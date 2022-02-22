@@ -6,6 +6,7 @@ use std::convert::Infallible;
 use std::net::{AddrParseError, SocketAddr};
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::Parser;
 use hyper::body::{HttpBody, Sender};
@@ -20,6 +21,7 @@ use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpSocket;
 use tokio::sync::watch;
 use tokio::sync::Mutex;
+use tokio::time::sleep;
 
 #[derive(Parser, Debug)]
 #[clap()]
@@ -48,6 +50,7 @@ struct ConnRx {
 }
 
 struct ConnTx {
+    fin: bool,
     seq: usize,
     stream: OwnedWriteHalf,
 }
@@ -296,6 +299,7 @@ async fn handle_new_conn<'a>(
         rx_pub,
         rx_sub,
         tx: Mutex::new(ConnTx {
+            fin: false,
             seq: written,
             stream: stream_tx,
         }),
@@ -307,6 +311,22 @@ async fn handle_new_conn<'a>(
         let id = id.clone();
         async move {
             filler(conn.clone(), stream_rx).await;
+            // give some time for the client to send it's own fin
+            // but force stop if no data is sent for 2 seconds continuously
+            let mut last_seq: Option<usize> = None;
+            loop {
+                let mut conn_tx = conn.tx.lock().await;
+                if conn_tx.fin {
+                    break;
+                }
+                if last_seq == Some(conn_tx.seq) {
+                    let _ = conn_tx.stream.shutdown().await;
+                    break;
+                }
+                last_seq = Some(conn_tx.seq);
+                drop(conn_tx);
+                sleep(Duration::from_millis(2000)).await;
+            }
             let mut ctx_locked = ctx.lock().await;
             ctx_locked.conns.remove(&id);
         }
@@ -412,6 +432,7 @@ async fn handle_post(
     if fin && seq == conn_tx.seq {
         conn_tx.stream.shutdown().await;
         seq += 1;
+        conn_tx.fin = true;
         conn_tx.seq += 1;
     }
 

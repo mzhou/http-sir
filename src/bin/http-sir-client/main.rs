@@ -135,7 +135,7 @@ async fn handle(cfg: CfgShared, ctx: CtxShared, mut stream: TcpStream, addr: Soc
             return;
         }
         if buf[1] != 1 {
-            eprintln!("socks5 incorrect cmd");
+            //eprintln!("socks5 incorrect cmd");
             return;
         }
         if buf[2] != 0 {
@@ -155,7 +155,7 @@ async fn handle(cfg: CfgShared, ctx: CtxShared, mut stream: TcpStream, addr: Soc
             eprintln!("socks5 couldn't send reply");
             return;
         }
-        eprintln!("socks5 proceeding");
+        //eprintln!("socks5 proceeding");
         SocketAddr::new(
             Ipv4Addr::new(buf[4], buf[5], buf[6], buf[7]).into(),
             (buf[8] as u16) << 8 | (buf[9] as u16),
