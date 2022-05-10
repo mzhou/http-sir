@@ -9,6 +9,7 @@ edition = "2021"
 clap = { features = ["derive"], version = "3.0" }
 hyper = { features = ["full"], version = "0.14" }
 hyper-rustls = { features = ["http2"], version = "0.23" }
+rustls = { features = ["dangerous_configuration"], version = "0.20" }
 thiserror = { version = "1.0" }
 tokio = { features = ["full"], version = "1.15" }
 uuid = { features = ["v4"], version = "0.8" }

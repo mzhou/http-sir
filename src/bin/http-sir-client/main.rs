@@ -17,6 +17,7 @@ use hyper::http::Method;
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Request, Response, Server, StatusCode};
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
+use rustls::{ClientConfig, ALL_CIPHER_SUITES, ALL_KX_GROUPS, ALL_VERSIONS};
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
@@ -83,16 +84,24 @@ impl Ctx {
         let mut http_connector = HttpConnector::new();
         http_connector.enforce_http(false);
         http_connector.set_nodelay(true);
-        Self {
-            client: Client::builder().build(
-                HttpsConnectorBuilder::new()
-                    .with_native_roots()
-                    .https_or_http()
-                    .enable_http1()
-                    .enable_http2()
-                    .wrap_connector(http_connector),
-            ),
-        }
+        let https = HttpsConnectorBuilder::new()
+            .with_tls_config(
+                ClientConfig::builder()
+                    .with_cipher_suites(&ALL_CIPHER_SUITES)
+                    .with_kx_groups(&ALL_KX_GROUPS)
+                    .with_protocol_versions(ALL_VERSIONS)
+                    .unwrap()
+                    .with_custom_certificate_verifier(Arc::new(
+                        danger::NoCertificateVerification {},
+                    ))
+                    .with_no_client_auth(),
+            )
+            .https_or_http()
+            .enable_http1()
+            .enable_http2()
+            .build();
+        let client = Client::builder().build::<_, hyper::Body>(https);
+        Self { client }
     }
 }
 
@@ -353,4 +362,22 @@ async fn transmit(
     }
 
     conn.active_tx.fetch_sub(1, Ordering::Relaxed);
+}
+
+mod danger {
+    pub struct NoCertificateVerification {}
+
+    impl rustls::client::ServerCertVerifier for NoCertificateVerification {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &rustls::Certificate,
+            _intermediates: &[rustls::Certificate],
+            _server_name: &rustls::ServerName,
+            _scts: &mut dyn Iterator<Item = &[u8]>,
+            _ocsp: &[u8],
+            _now: std::time::SystemTime,
+        ) -> Result<rustls::client::ServerCertVerified, rustls::Error> {
+            Ok(rustls::client::ServerCertVerified::assertion())
+        }
+    }
 }
