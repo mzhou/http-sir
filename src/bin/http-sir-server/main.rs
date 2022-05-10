@@ -88,7 +88,7 @@ fn blank_status(s: StatusCode) -> Response<Body> {
 async fn drainer(conn: ConnShared, mut sender: Sender, mut seq: usize) {
     let mut rx_sub = conn.rx_sub.clone();
     loop {
-        let mut fin = false;
+        let mut fin;
         let buf: Vec<u8> = {
             let conn_rx = conn.rx.lock().await;
             if seq < conn_rx.seq - conn_rx.buf.len() {
@@ -182,7 +182,7 @@ async fn handle_get<'a>(
         None => return Ok(blank_status(StatusCode::NOT_FOUND)),
     };
 
-    let mut fin = false;
+    let mut fin;
 
     {
         let conn_rx = conn.rx.lock().await;
@@ -430,8 +430,8 @@ async fn handle_post(
 
     // if we got fin, and we managed to catch up, shutdown the writer
     if fin && seq == conn_tx.seq {
-        conn_tx.stream.shutdown().await;
-        seq += 1;
+        let _ = conn_tx.stream.shutdown().await;
+        //seq += 1;
         conn_tx.fin = true;
         conn_tx.seq += 1;
     }

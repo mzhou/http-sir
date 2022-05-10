@@ -1,10 +1,6 @@
 #![feature(async_closure)]
 
-use std::cmp::min;
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::convert::Infallible;
 use std::net::{AddrParseError, Ipv4Addr, SocketAddr};
-use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -12,17 +8,15 @@ use std::time::Duration;
 use clap::Parser;
 use hyper::body::HttpBody;
 use hyper::client::{Client, HttpConnector};
-use hyper::header::{AsHeaderName, HeaderMap, HeaderValue};
+use hyper::header::HeaderValue;
 use hyper::http::Method;
-use hyper::service::{make_service_fn, service_fn};
-use hyper::{Body, Request, Response, Server, StatusCode};
+use hyper::{Body, Request, StatusCode};
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use rustls::{ClientConfig, ALL_CIPHER_SUITES, ALL_KX_GROUPS, ALL_VERSIONS};
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::net::tcp::OwnedWriteHalf;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, MutexGuard};
 use tokio::time::sleep;
 use uuid::Uuid;
 
