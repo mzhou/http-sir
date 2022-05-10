@@ -174,7 +174,7 @@ async fn handle(cfg: CfgShared, ctx: CtxShared, mut stream: TcpStream, addr: Soc
         cfg.target.clone()
     };
 
-    let id = format!("{}", Uuid::new_v4().to_hyphenated_ref());
+    let id = format!("{}", Uuid::new_v4().hyphenated());
     let client = ctx.client.clone();
 
     eprintln!("{} connecting to {}", id, target);
